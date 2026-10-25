@@ -19,6 +19,7 @@ available.
 
 import argparse
 import json
+import time
 from pathlib import Path
 from typing import Iterator
 
@@ -26,9 +27,12 @@ import yaml
 import numpy as np
 import soundfile as sf
 import librosa
+import subprocess
 
-
-AUDIO_EXTS = {".wav", ".flac", ".mp3", ".m4a", ".aac", ".ogg"}
+AUDIO_EXTS = {
+    ".mp3", ".m4a", ".flac", ".wav", ".aac", ".wma",
+    ".aiff", ".aif", ".ogg", ".opus", ".alac",
+}
 
 
 def load_config(path: str) -> dict:
@@ -38,18 +42,43 @@ def load_config(path: str) -> dict:
 
 def iter_tracks(root: Path) -> Iterator[Path]:
     for p in root.rglob("*"):
-        if p.suffix.lower() in AUDIO_EXTS:
-            yield p
+        if not p.is_file() or p.suffix.lower() not in AUDIO_EXTS:
+            continue
+
+        yield p
+
 
 
 def read_mono(path: Path, target_sr: int | None = None):
-    y, sr = sf.read(str(path), always_2d=False)
-    if isinstance(y, np.ndarray) and y.ndim > 1:
-        y = y.mean(axis=1)
-    if target_sr and sr != target_sr:
-        y = librosa.resample(y, orig_sr=sr, target_sr=target_sr)
-        sr = target_sr
-    return y.astype("float32"), sr
+    """Decode audio through FFmpeg, returning mono float32 samples."""
+    if target_sr is None:
+        y, sr = librosa.load(str(path), sr=None, mono=True)
+        return y.astype("float32"), sr
+
+    result = subprocess.run(
+        [
+            "ffmpeg", "-v", "error",
+            "-i", str(path),
+            "-map", "0:a:0",
+            "-f", "f32le",
+            "-ac", "1",
+            "-ar", str(target_sr),
+            "pipe:1",
+        ],
+        capture_output=True,
+        check=False,
+    )
+
+    if result.returncode != 0:
+        error = result.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"FFmpeg audio decoding failed: {error}")
+
+    y = np.frombuffer(result.stdout, dtype="<f4").copy()
+    if y.size == 0:
+        raise RuntimeError("FFmpeg returned no decoded audio samples.")
+
+    return y, target_sr
+
 
 
 def _polyfill_numpy_random_integers():
@@ -133,6 +162,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--limit", type=int, default=0,
+                help="Maximum number of new tracks to embed (0 = all)")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -141,46 +172,147 @@ def main(argv=None):
         print("music_dir not set or missing.")
         return
 
-    emb_path = Path(cfg.get("embeddings_file", "data/embeddings.npy"))
-    map_path = Path(cfg.get("mapping_file", "data/embedding_mapping.json"))
+    emb_path = Path(cfg.get("embedding_file", "data/embeddings.npy"))
+    map_path = Path(cfg.get("mapping_file", "data/embedding_mapping.txt"))
     emb_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Load existing embeddings/mapping unless --force was specified.
+    existing_embs = None
+    existing_mapping = []
+
     if emb_path.exists() and map_path.exists() and not args.force:
-        print("Embeddings already exist; use --force to recompute.")
+        try:
+            existing_embs = np.load(emb_path)
+            with map_path.open("r", encoding="utf-8") as f:
+                existing_mapping = list(json.load(f))
+
+            if existing_embs.ndim != 2:
+                raise ValueError(
+                    f"Embeddings must be 2D; got shape {existing_embs.shape}"
+                )
+            if existing_embs.shape[0] != len(existing_mapping):
+                raise ValueError(
+                    f"COUNT MISMATCH: {existing_embs.shape[0]} embedding rows "
+                    f"but {len(existing_mapping)} mapping paths. "
+                    "Restore a matching backup before continuing."
+                )
+
+            print(
+                f"Loaded existing embeddings: "
+                f"{existing_embs.shape[0]} tracks"
+            )
+        except Exception as e:
+            print(f"Could not load existing embeddings: {e}")
+            raise SystemExit(
+                "STOP: existing embeddings/mapping could not be loaded. "
+                "Existing data was not intentionally reset."
+            )
+
+    # Find tracks which don't already have an embedding.
+    tracks = list(iter_tracks(music_dir))
+
+    if existing_embs is not None:
+        existing_paths = set(existing_mapping)
+        new_tracks = [
+            p for p in tracks
+            if str(p) not in existing_paths
+        ]
+
+        print(f"Library contains {len(tracks)} audio files.")
+        print(f"Already embedded: {len(existing_mapping)}")
+        print(f"New tracks to embed: {len(new_tracks)}")
+    else:
+        new_tracks = tracks
+        print(f"Tracks to embed: {len(new_tracks)}")
+
+    if args.limit > 0:
+        new_tracks = new_tracks[:args.limit]
+        print(f"Limited to {len(new_tracks)} tracks for this run.")
+
+    if not new_tracks:
+        print("No new tracks to embed.")
         return
 
     print("Loading CLAP (htsat-tiny)…")
     model = _load_clap()
 
-    embs = []
-    mapping = []
+    new_embs = []
+    new_mapping = []
     count = 0
-    for p in iter_tracks(music_dir):
+    checkpoint_size = 100
+
+    print(f"Starting CLAP embedding of {len(new_tracks)} new tracks...", flush=True)
+    started_at = time.monotonic()
+
+    def save_checkpoint():
+        nonlocal existing_embs, existing_mapping, new_embs, new_mapping
+
+        if not new_embs:
+            return
+
+        batch_embs = np.vstack(new_embs).astype("float32")
+
+        if existing_embs is not None:
+            existing_embs = np.vstack([existing_embs, batch_embs])
+            existing_mapping.extend(new_mapping)
+        else:
+            existing_embs = batch_embs
+            existing_mapping = list(new_mapping)
+
+        # Write embeddings and mapping together.
+        np.save(emb_path, existing_embs)
+
+        with map_path.open("w", encoding="utf-8") as f:
+            json.dump(existing_mapping, f, ensure_ascii=False, indent=2)
+
+        print(
+            f"CHECKPOINT SAVED: {len(existing_mapping)} embeddings; "
+            f"mapping entries: {len(existing_mapping)}",
+            flush=True,
+        )
+
+        new_embs.clear()
+        new_mapping.clear()
+
+    for attempted, p in enumerate(new_tracks, start=1):
+        elapsed = time.monotonic() - started_at
+        if attempted > 1 and elapsed > 0:
+            seconds_per_track = elapsed / (attempted - 1)
+            remaining_seconds = (len(new_tracks) - attempted + 1) * seconds_per_track
+            eta_minutes = int(remaining_seconds // 60)
+            eta_seconds = int(remaining_seconds % 60)
+            eta_text = f"{eta_minutes}m {eta_seconds:02d}s"
+        else:
+            eta_text = "calculating..."
+        print(
+            f"PROGRESS {attempted}/{len(new_tracks)} "
+            f"({attempted / len(new_tracks):.1%}) | "
+            f"elapsed {int(elapsed // 60)}m {int(elapsed % 60):02d}s | "
+            f"ETA {eta_text} | {p.name}",
+            flush=True,
+        )
         try:
             y, sr = read_mono(p, target_sr=48000)
             emb = _embed_with_model(model, y, sr).astype("float32")
-            embs.append(emb)
-            mapping.append(str(p))
+
+            new_embs.append(emb)
+            new_mapping.append(str(p))
+
             count += 1
-            if count % 25 == 0:
-                print(f"Embedded {count} tracks…")
+            print(f"  EMBEDDED OK ({count} successful this run)", flush=True)
+
+            if len(new_embs) >= checkpoint_size:
+                save_checkpoint()
+
         except Exception as e:
-            print(f"Embedding failed for {p}: {e}")
+            print(f"Embedding failed for: {p}", flush=True)
+            print(f"Error type: {type(e).__name__}; details: {repr(e)}", flush=True)
 
-    if not embs:
-        print("No embeddings computed.")
-        return
+    # Save anything remaining after the final batch.
+    save_checkpoint()
 
-    embs_np = np.vstack(embs).astype("float32")
-    np.save(emb_path, embs_np)
-    with map_path.open("w", encoding="utf-8") as f:
-        json.dump(mapping, f, ensure_ascii=False, indent=2)
-    print(f"Wrote embeddings: {emb_path} shape={embs_np.shape}")
-    print(f"Wrote mapping: {map_path} ({len(mapping)} paths)")
-
-
+    print(f"Wrote embeddings: {emb_path} shape={existing_embs.shape}")
+    print(f"Wrote mapping: {map_path} ({len(existing_mapping)} paths)")
+    
 if __name__ == "__main__":
     main()
-
-
-
