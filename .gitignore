@@ -11,6 +11,7 @@ __pycache__/
 
 # Data artefacts (fingerprints, embeddings, indices, features)
 data/
+/music/
 
 # Local settings
 # Do not ignore config.yaml; it is part of the repository.  Leave the
