@@ -1,93 +1,121 @@
-# PulseFlow — Fork Setup Notes
+# PulseFlow â€” Fork Setup Notes
 
-This is a fork of pulseflow-ai-offline-music-recommender by Philippe-Guerrier. The original README.md is unchanged; this file covers what differs here.
+This is a fork of `pulseflow-ai-offline-music-recommender` by Philippe-Guerrier. The original `README.md` is unchanged. This file documents the fork-specific setup, test environments, and the first successful playlist test.
 
 ## What's different in this fork
 
 - Windows double-click playlist launcher: `playlist_launcher.ps1` and `playlist_launcher.bat`.
 - Separate Conda environment definitions for CLAP/FAISS and MusicNN.
-- Additional experiment scripts in `scripts/experiments/`. These may contain machine-specific paths and are not required for basic playlist generation.
+- Additional experiment scripts in `scripts/`. These may contain machine-specific paths and are not required for basic playlist generation.
+
+## Environments
+
+The fork uses two separate Conda environments:
+
+| Environment | Purpose | Main stack |
+|---|---|---|
+| `musicrec-fork-test` | CLAP embeddings, FAISS search, playlist generation | Python 3.11 |
+| `musicnn-fork-test` | MusicNN audio tagging | Python 3.7.16, TensorFlow 2.3.4 |
+
+Keep these environments separate. MusicNN uses an older dependency stack, including older NumPy requirements. The original `musicrec` and `musicnn` environments should remain untouched.
 
 ## Setup
 
-### 1. Create the Conda environments
+Run these commands from the repository root in Anaconda Prompt or another terminal where Conda is available.
 
-From the repository root, run:
+### 1. Create the environments
 
 ```bat
 conda env create -f environment-musicrec.yml
 conda env create -f environment-musicnn.yml
 ```
 
-These create the fork-specific environments:
+If an environment already exists, check it first with `conda env list` rather than recreating it blindly.
 
-- `musicrec-fork-test`
-- `musicnn-fork-test`
+### 2. Configure the local test library
 
-The original `musicrec` and `musicnn` environments are separate and should not be modified.
+Copy `config.yaml.example` to `config.yaml`, then edit `config.yaml` for your machine. Keep `config.yaml` local and do not overwrite `config.yaml.example`.
 
-### 2. Install the CLAP/FAISS Python requirements
+For the small fork test library, set `music_dir` to the repository's `music` folder. For example:
 
-Activate the CLAP/FAISS environment:
+`V:\GitHub\pulseflow-fork\music`
+
+The sample track used in the test below is:
+
+`V:\GitHub\pulseflow-fork\music\05 Helpless.m4a`
+
+The sample `music/` folder is excluded from Git by `.gitignore`. Do not accidentally point the fork configuration at the production library or production index files.
+
+### 3. Install the CLAP/FAISS environment requirements
+
+Activate the CLAP environment:
 
 ```bat
 conda activate musicrec-fork-test
 ```
 
-Install the Python requirements:
+Install the repository requirements:
 
 ```bat
 python -m pip install -r requirements.txt
 ```
 
-The `requirements.txt` file should contain the additional Python dependencies for CLAP/FAISS and playlist generation. Packages already supplied by Conda, including NumPy, SciPy and FAISS, should remain managed by the Conda environment unless there is a specific reason to change them.
-
-### 3. Configure the music library
-
-Edit `config.yaml` so the music library path points to your own collection.
-
-### 4. Generate embeddings
-
-Generate embeddings for your own music collection using the project's ingestion instructions and scripts.
-
-The `data/` directory contains derived data such as embeddings, the track mapping and FAISS index. These files are specific to a music collection and are not included in this repository.
-
-## Generating a playlist
-
-Activate the CLAP/FAISS environment:
+During the initial test, these additional installs were needed in the test environment:
 
 ```bat
-conda activate musicrec-fork-test
+python -m pip install "laion-clap @ git+https://github.com/LAION-AI/CLAP.git"
+python -m pip install requests pyyaml soundfile
 ```
 
-Then run:
+The first command installs LAION-CLAP from its Git repository. The second installs dependencies that were missing when the playlist command was first tested. If the requirements file already installs a package, there is no need to install it again.
+
+### 4. Check that the playlist command starts
 
 ```bat
-python scripts/generate_playlist.py --config config.yaml --length 20 --policy smooth
+python -m scripts.generate_playlist --help
 ```
 
-Options:
+The help text should appear without a missing-module error.
 
-- `--length`: playlist length; supported values are 10, 20, 30 or 40 tracks.
-- `--policy`: `smooth` or `contrast`.
+## Test embedding and playlist generation
 
-Alternatively, use `playlist_launcher.bat`. Edit the folder path inside the launcher to match the location where you cloned the repository.
+A small test library was used to verify the fork without touching the original production environment or music library. The test library had 25 tracks, with a 25-row `(25, 512)` embedding array and a matching FAISS index and mapping.
 
-## Which environment is used for what?
+With `musicrec-fork-test` active, run the following from the repository root:
 
-- **`musicrec-fork-test`** — Python 3.11, CLAP embeddings, FAISS similarity search and playlist generation.
-- **`musicnn-fork-test`** — Python 3.7.16, TensorFlow 2.3.4 and MusicNN tagging. This is a legacy dependency stack and must remain separate from the CLAP environment because of conflicting NumPy requirements.
+```bat
+python -m scripts.generate_playlist --config config.yaml --start-path "V:\GitHub\pulseflow-fork\music\05 Helpless.m4a" --length 10 --policy smooth
+```
 
-Activate the MusicNN environment when running MusicNN-specific tagging scripts:
+This test completed successfully and wrote:
+
+- `data\last_playlist.json`
+- `data\last_playlist.m3u8`
+
+Open `data\last_playlist.m3u8` in a compatible music player to check that the tracks resolve and play. The playlist output is generated locally and depends on the paths and index configured for this fork.
+
+### Why use `--start-path`?
+
+`--start-path` lets the script use a specified track as the seed. It avoids the audio-fingerprint recognition path used by `--input-audio`, which currently encounters a PyDejavu compatibility problem in the Python 3.11 test environment.
+
+## Troubleshooting
+
+- **`No module named requests`, `yaml`, or `soundfile`:** activate `musicrec-fork-test`, then run `python -m pip install requests pyyaml soundfile`.
+- **`No module named laion_clap`:** activate `musicrec-fork-test`, then run `python -m pip install "laion-clap @ git+https://github.com/LAION-AI/CLAP.git"`.
+- **PyDejavu `SyntaxError` involving `print`:** the installed PyDejavu package contains Python 2 syntax and is incompatible with Python 3.11. Use `--start-path` for this test rather than `--input-audio`.
+- **Missing embeddings, FAISS index, or mapping:** check the paths in `config.yaml` and confirm that the embedding array, mapping, and index belong to the fork's test library. Do not point the fork at production data by accident.
+- **Model download or audio decoding fails on first run:** confirm that the active environment has the required packages and that the audio file can be read. Some models or audio decoders may require an initial download or additional system dependencies.
+
+## MusicNN tagging
+
+Activate the separate legacy environment before running MusicNN-specific scripts:
 
 ```bat
 conda activate musicnn-fork-test
 ```
 
-## Known limitations
+MusicNN inference was successfully tested on `05 Helpless.m4a` in this environment. Keep MusicNN separate from `musicrec-fork-test`; do not combine their TensorFlow/NumPy stacks.
 
-- Scripts in `scripts/experiments/` may contain hard-coded paths and need editing before use on another machine.
-- The launcher is Windows-specific; the Python scripts may work on other platforms.
-- Model downloads and audio-decoding dependencies may be required on first use.
-- MusicNN uses an older Python and TensorFlow stack. Reproducing it on another machine may require compatible package sources and builds.
-- Successful environment creation does not guarantee that every experimental script will work without configuration changes.
+## Other notes and limitations
+
+- Feature extraction and feature-based ranking were verified on the 25-track test library. The latest playlist run reported seed tempo of approximately 136 BPM, energy of 0.185, and complete tempo/energy coverage for all 24 non-seed candidates.
