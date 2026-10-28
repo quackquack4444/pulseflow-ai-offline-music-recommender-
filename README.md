@@ -1,6 +1,6 @@
 # Local Music Recommendation System - Offline, Smooth, and Customizable
 
-This is my end-to-end **offline** music identification and recommendation system.  
+This is an end-to-end **offline** music identification and recommendation system.  
 No cloud, no hidden data uploads - it runs entirely on your machine.  
 It’s designed to avoid the usual Windows install headaches (no **Essentia** builds) and works on both GPU and CPU, but obviously flies faster with an NVIDIA GPU.
 
