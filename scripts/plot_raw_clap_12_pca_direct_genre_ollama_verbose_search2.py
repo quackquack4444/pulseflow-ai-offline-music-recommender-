@@ -255,6 +255,217 @@ def build_clap_context(embeddings, labels, genre_names):
     # float64 + rounding keeps the page payload small (float32.tolist() writes ~19 digits per value).
     return neighbour_ids, neighbour_scores, np.round(centroid_scores.astype(np.float64), 4).tolist(), cluster_genres
 
+SEARCH_HTML = '<style>#pfSearchInput:focus{border-color:#6cb6ff!important}#pfSearchGrip:hover{color:#6cb6ff!important}</style><div id="pfSearch" style="position:absolute;top:10px;left:50%;transform:translateX(-50%);width:clamp(220px,36vw,460px);z-index:10001;font:14px Arial,sans-serif;color:#eee"><div style="position:relative"><span id="pfSearchGrip" title="Drag to move (double-click to reset)" style="position:absolute;left:0;top:0;bottom:0;width:24px;display:flex;align-items:center;justify-content:center;cursor:move;color:#888;font-size:15px;line-height:1;user-select:none;touch-action:none">&#8942;&#8942;</span><input id="pfSearchInput" type="text" placeholder="Search artist, album or track…   ( / )" autocomplete="off" spellcheck="false" style="box-sizing:border-box;width:100%;padding:8px 32px 8px 26px;background:#20242a;color:#eee;border:1px solid #777;border-radius:8px;font:14px Arial,sans-serif;outline:none;box-shadow:0 2px 10px rgba(0,0,0,.5)"><span id="pfSearchClear" title="Clear search" style="display:none;position:absolute;right:10px;top:50%;transform:translateY(-50%);cursor:pointer;color:#aaa;font-size:18px;line-height:1">&times;</span></div><div id="pfSearchDrop" style="display:none;margin-top:4px;background:#1e1e1e;border:1px solid #777;border-radius:8px;box-shadow:0 4px 18px rgba(0,0,0,.65);overflow:hidden"><ul id="pfSearchList" style="list-style:none;margin:0;padding:4px;max-height:min(55vh,460px);overflow-y:auto"></ul><div style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:6px 10px;border-top:1px solid #444;font-size:11px;color:#aaa"><span id="pfSearchInfo"></span><label style="white-space:nowrap;cursor:pointer"><input type="checkbox" id="pfSearchCentre" checked> Centre map</label></div></div></div>'
+SEARCH_JS = r'''// ---- Track search (top centre) ----
+(function () {
+ const wrap = document.getElementById('pfSearch');
+ const input = document.getElementById('pfSearchInput');
+ const clearBtn = document.getElementById('pfSearchClear');
+ const drop = document.getElementById('pfSearchDrop');
+ const list = document.getElementById('pfSearchList');
+ const info = document.getElementById('pfSearchInfo');
+ const centreBox = document.getElementById('pfSearchCentre');
+ const MAX_SHOWN = 20;
+ let index = null, results = [], active = -1, timer = null, markerShown = false, centred = false;
+
+ // Case- and accent-insensitive: "Beyonce" finds "Beyoncé".
+ const fold = s => String(s).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+
+ function buildIndex() {
+  if (index) return;
+  const n = DATA.paths.length;
+  index = {title: new Array(n), artist: new Array(n), album: new Array(n)};
+  for (let i = 0; i < n; i++) {
+   const t = trackParts(i);
+   index.title[i] = fold(t.name);
+   index.artist[i] = fold(t.artist);
+   index.album[i] = fold(t.album);
+  }
+ }
+ // Word-start hits score higher than hits in the middle of a word.
+ function fieldScore(text, tok, atWord, inside) {
+  const p = text.indexOf(tok);
+  if (p < 0) return 0;
+  return (p === 0 || text[p - 1] === ' ') ? atWord : inside;
+ }
+ function search(query) {
+  const q = fold(query).trim();
+  if (q.length < 2) return null;
+  buildIndex();
+  const toks = q.split(/\s+/);
+  const cmp = (a, b) => b.score - a.score || index.title[a.i].length - index.title[b.i].length || a.i - b.i;
+  let best = [], total = 0;
+  for (let i = 0, n = DATA.paths.length; i < n; i++) {
+   const ti = index.title[i], ar = index.artist[i], al = index.album[i];
+   let score = 0, ok = true;
+   for (let k = 0; k < toks.length; k++) {
+    const s = fieldScore(ti, toks[k], 6, 3) + fieldScore(ar, toks[k], 4, 2) + fieldScore(al, toks[k], 2, 1);
+    if (!s) { ok = false; break; }
+    score += s;
+   }
+   if (!ok) continue;
+   if (ti === q) score += 10;
+   total++;
+   best.push({i, score});
+   if (best.length > 400) { best.sort(cmp); best.length = 60; }
+  }
+  best.sort(cmp);
+  return {items: best.slice(0, MAX_SHOWN), total};
+ }
+
+ function setActive(k) {
+  const rows = list.children;
+  if (active >= 0 && rows[active]) rows[active].style.background = '';
+  active = k;
+  if (k >= 0 && rows[k]) { rows[k].style.background = '#34404f'; rows[k].scrollIntoView({block: 'nearest'}); }
+ }
+ function render(res, q) {
+  list.innerHTML = '';
+  active = -1;
+  results = res ? res.items : [];
+  if (!res) { drop.style.display = 'none'; return; }
+  drop.style.display = 'block';
+  if (!res.items.length) info.textContent = 'No tracks match \u201c' + q.trim() + '\u201d.';
+  else info.textContent = res.total > res.items.length
+   ? 'Showing ' + res.items.length + ' of ' + res.total.toLocaleString() + ' matches \u2014 keep typing to narrow down'
+   : res.total + (res.total === 1 ? ' match' : ' matches');
+  res.items.forEach(({i}, k) => {
+   const t = trackParts(i);
+   const hidden = !visibleTrackSet.has(i);
+   const li = document.createElement('li');
+   li.style.cssText = 'padding:5px 8px;margin:2px 0;border-left:4px solid ' + DATA.colours[DATA.labels[i]] + ';cursor:pointer;border-radius:3px;word-break:break-word';
+   li.innerHTML = '<div style="font-weight:600">' + esc(t.name) + '</div><div style="font-size:11px;color:#aaa">'
+    + esc(t.artist) + (t.album ? ' \u2014 ' + esc(t.album) : '') + ' \u00b7 ' + clusterTag(i)
+    + (hidden ? ' \u00b7 <span style="color:#e8b86d">hidden by current filters</span>' : '') + '</div>';
+   li.addEventListener('mousedown', e => e.preventDefault());
+   li.addEventListener('mousemove', () => { if (active !== k) setActive(k); });
+   li.addEventListener('click', () => choose(i));
+   list.appendChild(li);
+  });
+ }
+ function go() {
+  timer = null;
+  render(search(input.value), input.value);
+ }
+
+ // Move the 3D camera's look-at point onto a track (camera centre is in the scene's aspect-ratio-scaled units).
+ function centreOn(i) {
+  try {
+   const s = plot._fullLayout && plot._fullLayout.scene;
+   if (!s) return;
+   const ar = s.aspectratio || {x: 1, y: 1, z: 1};
+   const f = (v, ax, a) => { const r = ax && ax.range; return r && r[1] !== r[0] ? (v - (r[0] + r[1]) / 2) / (r[1] - r[0]) * a : 0; };
+   centred = true;
+   return Plotly.relayout(plot, {'scene.camera.center': {x: f(DATA.x[i], s.xaxis, ar.x), y: f(DATA.y[i], s.yaxis, ar.y), z: f(DATA.z[i], s.zaxis, ar.z)}});
+  } catch (err) { console.log('Could not centre the map:', err); }
+ }
+ function mark(i) {
+  markerShown = true;
+  return Plotly.restyle(plot, {x: [[DATA.x[i]]], y: [[DATA.y[i]]], z: [[DATA.z[i]]], customdata: [[DATA.paths[i]]]}, [3])
+   .then(() => { if (centreBox.checked) return centreOn(i); })
+   .catch(err => { status.textContent = 'Could not mark the search result: ' + err; });
+ }
+ function choose(i) {
+  const t = trackParts(i);
+  input.value = t.name + (t.artist ? ' \u2014 ' + t.artist : '');
+  clearBtn.style.display = 'block';
+  drop.style.display = 'none';
+  results = [];
+  showPanel({customdata: DATA.paths[i]});   // opens the track panel and, if enabled, the sonic neighbours
+  mark(i);
+  if (!visibleTrackSet.has(i)) status.textContent = 'That track is hidden by the current filters; it is shown on the map as a yellow diamond.';
+ }
+ function clearSearch() {
+  if (timer) { clearTimeout(timer); timer = null; }
+  input.value = '';
+  clearBtn.style.display = 'none';
+  drop.style.display = 'none';
+  results = [];
+  if (markerShown) { markerShown = false; Plotly.restyle(plot, {x: [[]], y: [[]], z: [[]], customdata: [[]]}, [3]); }
+  if (centred) { centred = false; Plotly.relayout(plot, {'scene.camera.center': {x: 0, y: 0, z: 0}}); }
+  input.focus();
+ }
+
+ input.addEventListener('input', () => {
+  clearBtn.style.display = input.value ? 'block' : 'none';
+  if (timer) clearTimeout(timer);
+  timer = setTimeout(go, 120);
+ });
+ input.addEventListener('focus', () => {
+  buildIndex();
+  if (results.length && input.value) drop.style.display = 'block';
+ });
+ input.addEventListener('keydown', e => {
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+   if (drop.style.display === 'none' && input.value) go();
+   if (!results.length) return;
+   e.preventDefault();
+   const n = results.length;
+   setActive(e.key === 'ArrowDown' ? (active + 1) % n : (active - 1 + n) % n);
+  } else if (e.key === 'Enter') {
+   if (timer) { clearTimeout(timer); go(); }
+   if (!results.length) return;
+   e.preventDefault();
+   choose(results[active >= 0 ? active : 0].i);
+  } else if (e.key === 'Escape') {
+   if (drop.style.display !== 'none') drop.style.display = 'none'; else input.blur();
+  }
+ });
+
+ // Drag the box by its grip. The first drag swaps the centred layout for explicit pixel positions.
+ const grip = document.getElementById('pfSearchGrip');
+ let dragFrom = null;
+ function clampBox() {
+  const par = wrap.offsetParent;
+  if (!par || wrap.style.transform !== 'none') return;
+  const maxL = Math.max(0, par.clientWidth - wrap.offsetWidth), maxT = Math.max(0, par.clientHeight - 40);
+  wrap.style.left = Math.min(maxL, Math.max(0, wrap.offsetLeft)) + 'px';
+  wrap.style.top = Math.min(maxT, Math.max(0, wrap.offsetTop)) + 'px';
+ }
+ grip.addEventListener('pointerdown', e => {
+  const par = wrap.offsetParent;
+  if (!par) return;
+  const r = wrap.getBoundingClientRect(), pr = par.getBoundingClientRect();
+  wrap.style.transform = 'none';
+  wrap.style.width = r.width + 'px';
+  wrap.style.left = (r.left - pr.left) + 'px';
+  wrap.style.top = (r.top - pr.top) + 'px';
+  dragFrom = {x: e.clientX, y: e.clientY, left: r.left - pr.left, top: r.top - pr.top};
+  grip.setPointerCapture(e.pointerId);
+  e.preventDefault();
+ });
+ grip.addEventListener('pointermove', e => {
+  if (!dragFrom) return;
+  const par = wrap.offsetParent;
+  const maxL = Math.max(0, par.clientWidth - wrap.offsetWidth), maxT = Math.max(0, par.clientHeight - 40);
+  wrap.style.left = Math.min(maxL, Math.max(0, dragFrom.left + e.clientX - dragFrom.x)) + 'px';
+  wrap.style.top = Math.min(maxT, Math.max(0, dragFrom.top + e.clientY - dragFrom.y)) + 'px';
+ });
+ grip.addEventListener('pointerup', () => { dragFrom = null; });
+ grip.addEventListener('pointercancel', () => { dragFrom = null; });
+ grip.addEventListener('dblclick', () => {
+  wrap.style.transform = 'translateX(-50%)';
+  wrap.style.left = '50%';
+  wrap.style.top = '10px';
+  wrap.style.width = '';
+ });
+ window.addEventListener('resize', clampBox);
+ clearBtn.addEventListener('click', clearSearch);
+ // Click anywhere outside the search box closes the result list.
+ document.addEventListener('mousedown', e => { if (!wrap.contains(e.target)) drop.style.display = 'none'; }, true);
+ // "/" or Ctrl/Cmd+K jumps to the search box.
+ document.addEventListener('keydown', e => {
+  const tag = (document.activeElement && document.activeElement.tagName) || '';
+  const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(tag);
+  if ((e.key === '/' && !typing && !e.ctrlKey && !e.metaKey && !e.altKey) || ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k')) {
+   e.preventDefault();
+   input.focus();
+   input.select();
+  }
+ });
+})();
+'''
+
 def main():
     print("Loading existing coordinates, cluster labels and paths...", flush=True)
     coords = np.load(COORDS_FILE, allow_pickle=False)
@@ -311,7 +522,7 @@ def main():
         distances = np.linalg.norm(coords[member_ids] - centre, axis=1)
         outlier_distance[member_ids] = distances
         outlier_cutoffs[str(cluster_id)] = {str(q): float(np.percentile(distances, q)) for q in (99, 97.5, 95)}
-    fig = go.Figure(data=[go.Scatter3d(x=coords[initial,0], y=coords[initial,1], z=coords[initial,2], mode="markers", name="Tracks", marker=dict(size=3, color=initial_colours, opacity=0.9), customdata=np.asarray(relative_paths, dtype=object)[initial], hovertemplate="<b>%{customdata}</b><extra></extra>"), go.Scatter3d(x=[], y=[], z=[], mode="lines+markers", name="Playlist route", showlegend=False, line=dict(width=5, color=[], colorscale="Turbo", cmin=0, cmax=1), marker=dict(size=4, color=[], colorscale="Turbo", cmin=0, cmax=1, showscale=False), customdata=[], text=[], hovertemplate="<b>%{text}</b><extra></extra>"), go.Scatter3d(x=[], y=[], z=[], mode="markers", name="Sonic neighbourhood", showlegend=False, marker=dict(size=7, color=[], opacity=1.0, line=dict(width=1, color="#ffffff")), customdata=[], hovertemplate="<b>%{customdata}</b><extra></extra>")])
+    fig = go.Figure(data=[go.Scatter3d(x=coords[initial,0], y=coords[initial,1], z=coords[initial,2], mode="markers", name="Tracks", marker=dict(size=3, color=initial_colours, opacity=0.9), customdata=np.asarray(relative_paths, dtype=object)[initial], hovertemplate="<b>%{customdata}</b><extra></extra>"), go.Scatter3d(x=[], y=[], z=[], mode="lines+markers", name="Playlist route", showlegend=False, line=dict(width=5, color=[], colorscale="Turbo", cmin=0, cmax=1), marker=dict(size=4, color=[], colorscale="Turbo", cmin=0, cmax=1, showscale=False), customdata=[], text=[], hovertemplate="<b>%{text}</b><extra></extra>"), go.Scatter3d(x=[], y=[], z=[], mode="markers", name="Sonic neighbourhood", showlegend=False, marker=dict(size=7, color=[], opacity=1.0, line=dict(width=1, color="#ffffff")), customdata=[], hovertemplate="<b>%{customdata}</b><extra></extra>"), go.Scatter3d(x=[], y=[], z=[], mode="markers", name="Search result", showlegend=False, marker=dict(size=12, color="#ffeb3b", symbol="diamond", opacity=1.0, line=dict(width=2, color="#000000")), customdata=[], hovertemplate="<b>%{customdata}</b><extra>Search result</extra>")])
     fig.update_layout(title="PulseFlow — raw CLAP 12-cluster map — Direct PCA<br><sup>512D → 3D</sup>", template="plotly_dark", height=850, scene=dict(xaxis_title="PC 1", yaxis_title="PC 2", zaxis_title="PC 3", aspectmode="data"), showlegend=False, margin=dict(l=0,r=0,t=75,b=0))
     html = fig.to_html(include_plotlyjs=True, full_html=True, div_id="pulseflow-map")
     payload = json.dumps({"x":coords[:,0].tolist(), "y":coords[:,1].tolist(), "z":coords[:,2].tolist(), "labels":labels.tolist(), "types":type_ids, "genres":genre_names, "genreNames":genre_options, "plus":plus, "plusDir":plus_dir, "tagNames":tag_names, "tagGroups":tag_groups, "trackTags":track_tags, "bpm":bpm, "keyNames":key_names, "trackKey":track_key, "energy":energy_bucket, "paths":relative_paths, "colours":cluster_colours, "outlierDistance":outlier_distance.tolist(), "outlierCutoffs":outlier_cutoffs, "prefix":MUSIC_PREFIX, "initialCount":len(initial), "neighbourIds":neighbour_ids, "neighbourScores":neighbour_scores, "centroidScores":centroid_scores, "clusterGenres":cluster_genres, "helper":PLAYER_HELPER, "inline":INLINE_AUDIO}, separators=(",",":"))
@@ -321,7 +532,7 @@ def main():
         for i, name in enumerate(genre_options)
     )
     controls = f'''<div id="controls" style="box-sizing:border-box;width:270px;min-width:190px;max-width:42vw;height:100vh;overflow-y:auto;resize:horizontal;overflow-x:hidden;padding:14px;background:#20242a;color:#eee;font:14px Arial"><h3 style="margin:0 0 5px">Map filters</h3><div id="displayedCounter" style="font-size:12px;color:#9fd;margin:0 0 12px">Displayed points: {len(initial):,} / {n:,}</div><b>Recording type</b><div><label><input type="checkbox" class="type" value="0" checked> Studio</label></div><div><label><input type="checkbox" class="type" value="1"> Live / LiveAlbum</label></div><div><label><input type="checkbox" class="type" value="2"> Other / unclassified</label></div><hr style="border-color:#555"><b>iTunes Genre</b><div style="font-size:11px;color:#aaa;margin:4px 0 8px">Classical is listed separately and can be switched on or off independently.</div><div style="display:flex;gap:6px;margin-bottom:7px"><button id="allGenres">All genres</button> <button id="noGenres">Clear genres</button></div><div style="display:flex;flex-direction:column;gap:4px;max-height:240px;overflow-y:auto">{genre_controls}</div><div style="margin:10px 0 10px"><label><input type="checkbox" id="excludePlus"> Exclude paths containing +</label></div><div style="margin:8px 0 16px;padding:8px;border:1px solid #555;border-radius:5px"><label><input type="checkbox" id="hideOutliers"> Hide distant 3D points</label><div style="margin:8px 0 0 22px;font-size:12px;color:#ccc">Hide points beyond each cluster's distance percentile:</div><select id="outlierLevel" style="margin:6px 0 0 22px;max-width:205px"><option value="99">Very few (99th percentile)</option><option value="97.5" selected>Moderate (97.5th percentile)</option><option value="95">More (95th percentile)</option></select><div style="font-size:11px;color:#aaa;margin:6px 0 0 22px">Visual filter only; no tracks are deleted.</div></div><div style="margin:10px 0;padding:8px;border:1px solid #555;border-radius:5px"><label><input type="checkbox" id="showSonicPanel"> Show sonic-neighbour panel</label><div style="font-size:11px;color:#aaa;margin:4px 0 0 22px">Shows the nearest CLAP matches when you click a point.</div><div style="margin:6px 0 0 22px"><label><input type="checkbox" id="fadeOutsideSonic"> Fade tracks outside this sonic neighbourhood</label></div><div style="margin:6px 0 0 22px"><label><input type="checkbox" id="excludePlusSonic"> Exclude '+' folders from sonic neighbours</label></div><div style="margin:6px 0 0 22px"><label><input type="checkbox" id="sonicVerbose" checked> Detailed neighbour list</label><div style="font-size:11px;color:#aaa;margin:2px 0 0 22px">Adds album, genre, cluster, same artist/album, mood/sound tags, tempo and key where available.</div></div></div><hr style="border-color:#555"><b>Playlist route</b><div style="margin:8px 0"><input type="file" id="playlistFile" accept=".m3u,.m3u8,.txt" style="max-width:240px"></div><div><label><input type="checkbox" id="fadeOthers"> Fade other tracks</label></div><div style="margin:6px 0"><button id="clearRoute">Clear route</button></div><p id="playlistStatus" style="font-size:12px;color:#ccc;line-height:1.4;margin:4px 0 10px">Load an .m3u/.m3u8 file to draw its order as a route.</p><hr style="border-color:#555"><b>CLAP clusters</b><div style="display:flex;flex-direction:column;gap:5px;margin-top:8px">{clusters}</div><div style="position:sticky;bottom:0;background:#20242a;padding:10px 0"><button id="allClusters">Select all</button> <button id="noClusters">Clear all</button></div><p id="status" style="line-height:1.4">Preparing initial selection...</p><p id="sonicTiming" style="font-size:11px;color:#8a8;margin:0"></p></div>'''
-    js = r'''<script>
+    js = (r'''<script>
 const DATA = __PULSEFLOW_DATA__;
 const plot = document.getElementById('pulseflow-map');
 const status = document.getElementById('status');
@@ -813,8 +1024,8 @@ document.getElementById('clearRoute').addEventListener('click', () => {
  drawRoute([], '', []);
  plStatus.textContent = 'Route cleared.';
 });
-</script>'''.replace("__PULSEFLOW_DATA__", payload)
-    html = html.replace("<body>", "<body>\n<div id=\"appLayout\" style=\"display:flex;width:100%;height:100vh;overflow:hidden;gap:0\">\n" + controls + "\n<div id=\"chartColumn\" style=\"flex:1;min-width:260px;height:100vh;overflow:hidden\">", 1)
+''' + SEARCH_JS + "</script>").replace("__PULSEFLOW_DATA__", payload)
+    html = html.replace("<body>", "<body>\n<div id=\"appLayout\" style=\"display:flex;width:100%;height:100vh;overflow:hidden;gap:0\">\n" + controls + "\n<div id=\"chartColumn\" style=\"flex:1;min-width:260px;height:100vh;overflow:hidden;position:relative\">\n" + SEARCH_HTML, 1)
     right_panel = '<div id="rightPanel" style="display:none;box-sizing:border-box;width:330px;min-width:220px;max-width:48vw;height:100vh;overflow-y:auto;resize:horizontal;overflow-x:hidden;padding:12px;background:#20242a;color:#eee;font:13px Arial;border-left:1px solid #555"><section id="sonicPanel" style="display:none;margin-bottom:18px"><h3 style="margin:0 0 6px">Sonic neighbours</h3><div id="sonicTitle" style="font-weight:600;word-break:break-word">Click a track</div><div id="sonicMeta" style="font-size:11px;color:#aaa;margin:4px 0 8px">Nearest points in the 3D map</div><div id="sonicTags" style="margin:0 0 8px"></div><ol id="sonicList" style="padding-left:22px;line-height:1.35"></ol></section><section id="playlistPanel" style="display:none"><h3 id="plTitle" style="margin:0 0 4px;word-break:break-word">Playlist</h3><div id="plCount" style="color:#aaa;margin-bottom:6px"></div><div id="plMsg" style="color:#e88;font-size:12px;margin-bottom:6px"></div><ol id="plList" style="margin:0;padding-left:30px;line-height:1.4"></ol><div id="plMissed" style="margin-top:12px;font-size:12px;color:#aaa"></div></section></div>'
     html = html.replace("</body>", "</div>\n" + right_panel + "\n</div>\n" + js + "\n</body>", 1)
     TEMP_OUTPUT.write_text(html, encoding="utf-8")
