@@ -75,5 +75,19 @@ Exact script name not confirmed.
 These were generated as part of the music-map workflow, using PCA, clustering and UMAP. The previously identified scripts\rebuild_music_map.py is the map-rebuild script, but I can't confirm from the available record that it writes all three files directly.
 The distinction matters: the PCA, cluster-label and UMAP files are derived map data, not part of the core CLAP/FAISS library. Since the core library has changed since the last recorded map build, those datasets should be checked for row alignment before being reused.
 
+# Reminder how to run
+Drop 50+ tracks into \music\ - or point config etc at music library
+
+conda activate musicrec
+cd to root 
+
+1 python .\scripts\maintain_clap_library.py --apply     ingests or adds/updates/deletes tracks
+2 make a playlist (optional) python -m scripts.generate_playlist --config config.yaml --start-path "/music/ xxxx.mp3"
+3 python .\scripts\rebuild_music_map.py                 these last 4 are for the 3D cluster PCA12 charts
+4 python .\scripts\cluster_raw_clap_12_for_map.py
+5 python .\scripts\experiment_3d_projections.py
+6 python .\scripts\plot_raw_clap_12_pca_direct_genre_sonic_panel_float_clap_detail_fade_overlay_clickfix.py
+7 open the html file that the last one creates
+
 
 
