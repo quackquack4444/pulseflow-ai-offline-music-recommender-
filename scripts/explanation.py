@@ -137,40 +137,151 @@ def explain_transition(
 
 
 
-def _ollama(prompt: str, model: str = "qwen2.5:3b", max_tokens: int = 160, temperature: float = 0.7) -> str:
-    # Minimal local call to Ollama CLI. Keep it simple & offline.
-    cmd = ["ollama", "run", model, "--nowordwrap"]
-    p = subprocess.run(cmd, input=prompt.encode("utf-8"), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    return p.stdout.decode("utf-8", errors="ignore").strip()
+def _ollama(
+    prompt: str,
+    model: str = "qwen2.5:3b",
+    max_tokens: int = 160,
+    temperature: float = 0.7,
+    timeout: int = 90,
+) -> str:
+    """Generate text through the local Ollama API."""
 
-def explain_playlist_summary(tracks: List[Dict], policy: str, model: str, max_tokens:int, temperature:float) -> Dict[str,str]:
-    titles = [f"{t.get('title') or t.get('path')}" for t in tracks]
-    prompt = (
-      "You are a concise music adviser. In 3 short sentences:\n"
-      "1) Name ONE standout track from this list as 'Top pick'.\n"
-      "2) Describe the overall vibe in 1 sentence.\n"
-      f"3) Mention how the sequencing fits a {policy} policy.\n"
-      "Tracks:\n- " + "\n- ".join(titles) + "\n"
-      "Respond as:\nTop pick: <title>\nOverview: <one sentence>\n"
-    )
-    txt = _ollama(prompt, model=model, max_tokens=max_tokens, temperature=temperature)
-    top, overview = "", ""
-    for line in txt.splitlines():
-        lo = line.lower()
-        if lo.startswith("top pick"):
-            top = line.split(":",1)[-1].strip()
-        elif lo.startswith("overview"):
-            overview = line.split(":",1)[-1].strip()
-    return {"top_pick": top, "overview": overview or txt[:240]}
+    url = "http://localhost:11434/api/generate"
 
-def explain_transition(curr: Dict, nxt: Dict, stats: Dict[str,str], model: str, max_tokens:int, temperature:float) -> str:
-    t1 = curr.get("title") or curr.get("path")
-    t2 = nxt.get("title") or nxt.get("path")
-    s = ", ".join([f"{k}={v}" for k,v in (stats or {}).items()])
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "num_predict": max_tokens,
+            "temperature": temperature,
+        },
+    }
+
+    try:
+        response = requests.post(
+            url,
+            json=payload,
+            timeout=(5, timeout),
+        )
+        response.raise_for_status()
+
+        text = response.json().get("response", "").strip()
+
+        if not text:
+            raise RuntimeError("Ollama returned an empty response.")
+
+        return text
+
+    except requests.exceptions.Timeout:
+        raise RuntimeError(
+            f"Ollama did not respond within {timeout} seconds."
+        )
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(f"Ollama request failed: {exc}")
+
+def explain_playlist_summary(
+    tracks: List[Dict],
+    policy: str,
+    model: str,
+    max_tokens: int,
+    temperature: float,
+) -> Dict[str, str]:
+
+    titles = [
+        str(t.get("title") or t.get("path") or "Unknown track")
+        for t in tracks
+    ]
+
+    if not titles:
+        return {"top_pick": "", "overview": "No tracks in playlist."}
+
     prompt = (
-      "Be concise (≤2 sentences). Explain why this transition works for listening.\n"
-      f"From: {t1}\nTo: {t2}\nStats: {s}\n"
-      "End with one emoji."
+        "You are a concise music adviser. In 3 short sentences:\n"
+        "1) Name ONE standout track from this list as 'Top pick'.\n"
+        "2) Describe the overall vibe in 1 sentence.\n"
+        f"3) Mention how the sequencing fits a {policy} policy.\n"
+        "Tracks:\n- " + "\n- ".join(titles) + "\n"
+        "Respond as:\n"
+        "Top pick: <title>\n"
+        "Overview: <one sentence>\n"
     )
-    return _ollama(prompt, model=model, max_tokens=max_tokens, temperature=temperature)
+
+    try:
+        txt = _ollama(
+            prompt,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+
+        top, overview = "", ""
+
+        for line in txt.splitlines():
+            lower = line.lower()
+
+            if lower.startswith("top pick"):
+                top = line.split(":", 1)[-1].strip()
+            elif lower.startswith("overview"):
+                overview = line.split(":", 1)[-1].strip()
+
+        return {
+            "top_pick": top or titles[0],
+            "overview": overview or txt[:240],
+        }
+
+    except Exception as exc:
+        print(f"Ollama summary fallback: {exc}", flush=True)
+
+        return {
+            "top_pick": titles[0],
+            "overview": (
+                f"A {policy} playlist containing {len(titles)} tracks. "
+                "The sequence was generated using the playlist ranking system."
+            ),
+        }
+
+def explain_transition(
+    curr: Dict,
+    nxt: Dict,
+    stats: Dict[str, str],
+    model: str,
+    max_tokens: int,
+    temperature: float,
+) -> str:
+    """Explain a transition, falling back to a basic description."""
+
+    t1 = curr.get("title") or curr.get("path") or "Unknown track"
+    t2 = nxt.get("title") or nxt.get("path") or "Unknown track"
+
+    stats = stats or {}
+    stat_text = ", ".join(
+        f"{key}={value}" for key, value in stats.items()
+    )
+
+    prompt = (
+        "Be concise (no more than 2 sentences). "
+        "Explain why this transition works for listening.\n"
+        f"From: {t1}\n"
+        f"To: {t2}\n"
+        f"Stats: {stat_text}\n"
+        "End with one emoji."
+    )
+
+    try:
+        return _ollama(
+            prompt,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+
+    except Exception as exc:
+        print(f"Ollama transition fallback: {exc}", flush=True)
+
+        description = f"Moving from {t1} to {t2}."
+        if stat_text:
+            description += f" Available transition information: {stat_text}."
+
+        return description
 
