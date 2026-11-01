@@ -1,4 +1,4 @@
-﻿"""Endâ€‘toâ€‘end playlist generation.
+"""Endâ€‘toâ€‘end playlist generation.
 
 This script identifies the current track either from an audio snippet
 (embedding match) or directly from a provided file path, selects
@@ -14,9 +14,13 @@ Exactly one of --input-audio or --start-path must be provided.
 # scripts/generate_playlist.py â€” FAISS search + playlist (CLAP_Module + PyTorch 2.6+ allowlist + NumPy 2.x polyfill)
 
 from pathlib import Path
+import sys
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
 from scripts import explanation as ex
 from main import load_config
-
+from pathlib import Path
 import argparse
 import json
 from pathlib import Path
@@ -31,6 +35,8 @@ import librosa
 #from dejavu.recognize import FileRecognizer
 
 import io, os, tempfile
+
+
 
 # --- stringify safety for LLM fields ---
 def _coerce_text(val):
@@ -204,49 +210,64 @@ def _select_tracks(index, mapping, seed_emb: np.ndarray, length: int,
                    include_plus_paths=False):
     import math
     import os
+    import re
 
     seed = seed_emb.reshape(1, -1).astype("float32")
     faiss.normalize_L2(seed)
 
-    k = min(max(length * 30, 300), len(mapping))
-    D, I = index.search(seed, k)
-    cand = [
-        (mapping[i], float(d))
-        for i, d in zip(I[0].tolist(), D[0].tolist())
-        if i >= 0
-    ]
-    print(f"\nFAISS candidate pool: {len(cand)} tracks before feature re-ranking")
-    import re
-
     def in_plus_folder(path):
-        normalised = str(path).replace("\\", "/")
-        return re.search(r"\+/", normalised) is not None
+        # Exclude a directory whose name ends in "+", e.g. ".../Album+/".
+        normalised = str(path).replace("\\\\", "/")
+        return re.search(r"(?:^|/)[^/]+\\+/", normalised) is not None
 
-    # Exclude tracks inside directories ending in + by default.
-    # Recognises both Windows (\) and Linux (/) separators.
-    seed_key = os.path.normcase(os.path.normpath(str(seed_path))) if seed_path else None
+    seed_key = (
+        os.path.normcase(os.path.normpath(str(seed_path)))
+        if seed_path else None
+    )
 
-    before_filter = len(cand)
+    # Keep a similarly sized pool of eligible candidates even when many of
+    # the nearest FAISS results belong to excluded "+" folders.
+    target_pool = min(max(length * 30, 300), len(mapping))
+    k = min(target_pool, len(mapping))
+    cand = []
 
-    if not include_plus_paths:
-        cand = [
-            (path, score) for path, score in cand
-            if not in_plus_folder(path)
-            or (
-                seed_key is not None
-                and os.path.normcase(os.path.normpath(str(path))) == seed_key
-            )
-        ]
-        print(
-            f"Excluded {before_filter - len(cand)} tracks from + folders; "
-            f"{len(cand)} candidates remain"
-        )
-    else:
+    while True:
+        D, I = index.search(seed, k)
+        cand = []
+        seen_paths = set()
+        excluded_plus = 0
+
+        for i, score in zip(I[0].tolist(), D[0].tolist()):
+            if i < 0:
+                continue
+            path = mapping[i]
+            path_key = os.path.normcase(os.path.normpath(str(path)))
+
+            # The seed is placed at the start of the playlist separately.
+            if seed_key is not None and path_key == seed_key:
+                continue
+            if not include_plus_paths and in_plus_folder(path):
+                excluded_plus += 1
+                continue
+            if path_key in seen_paths:
+                continue
+            seen_paths.add(path_key)
+            cand.append((path, float(score)))
+
+        if len(cand) >= target_pool or k >= len(mapping):
+            break
+        k = min(len(mapping), max(k + 1, k * 2))
+
+    print(
+        f"\\nFAISS searched {k} tracks; {len(cand)} eligible candidates "
+        f"after excluding {excluded_plus} tracks in + folders"
+    )
+    if include_plus_paths:
         print("Including tracks from + folders")
-    
-    for rank, (path, score) in enumerate(cand, 1):
-        print(f"{rank:2d}. {score:.3f}  {Path(path).parent.name} â€” {Path(path).stem}")
-    cand = [(path, score) for path, score in cand if os.path.normcase(os.path.normpath(str(path))) != os.path.normcase(os.path.normpath(str(seed_path)))]
+
+    for rank, (path, score) in enumerate(cand[:min(len(cand), 15)], 1):
+        print(f"{rank:2d}. {score:.3f}  {Path(path).parent.name} — {Path(path).stem}")
+
     # Feature-aware ranking for a known seed track.
     if policy == "smooth" and seed_path and cfg:
         features = _load_feature_lookup(cfg)
@@ -298,21 +319,21 @@ def _select_tracks(index, mapping, seed_emb: np.ndarray, length: int,
                     feature_sim = (tempo_sim + energy_sim) / 2
                     combined = 0.85 * clap_norm + 0.15 * feature_sim
                 else:
-                    # Missing features: use normalized CLAP alone.
                     combined = clap_norm
 
                 ranked.append((
                     path, score, combined, tempo, energy,
                     tempo_sim, energy_sim
                 ))
+
             print(
-                f"\nFeature coverage: {len(cand) - missing_features}/{len(cand)} "
+                f"\\nFeature coverage: {len(cand) - missing_features}/{len(cand)} "
                 f"complete; {missing_tempo} missing tempo; "
                 f"{missing_energy} missing energy"
-            )                
+            )
             ranked.sort(key=lambda item: item[2], reverse=True)
 
-            print("\nRanking diagnostics (top candidates):")
+            print("\\nRanking diagnostics (top candidates):")
             print(" #  CLAP    Tempo  Energy  T-sim  E-sim  Combined  Track")
             for i, item in enumerate(ranked[:min(length, 15)], 1):
                 path, score, combined, tempo, energy, ts, es = item
@@ -329,9 +350,10 @@ def _select_tracks(index, mapping, seed_emb: np.ndarray, length: int,
             out = []
             seen = set()
             for path, score, combined, *_ in ranked:
-                if path in seen:
+                key = path_key(path)
+                if key in seen:
                     continue
-                seen.add(path)
+                seen.add(key)
                 out.append((path, score))
                 if len(out) >= length:
                     break
@@ -342,9 +364,10 @@ def _select_tracks(index, mapping, seed_emb: np.ndarray, length: int,
     if policy == "smooth":
         seen = set()
         for path, score in sorted(cand, key=lambda item: item[1], reverse=True):
-            if path in seen:
+            key = os.path.normcase(os.path.normpath(str(path)))
+            if key in seen:
                 continue
-            seen.add(path)
+            seen.add(key)
             out.append((path, score))
             if len(out) >= length:
                 break
@@ -358,20 +381,23 @@ def _select_tracks(index, mapping, seed_emb: np.ndarray, length: int,
             if hi_i < len(hi):
                 path, score = hi[hi_i]
                 hi_i += 1
-                if path not in seen:
+                key = os.path.normcase(os.path.normpath(str(path)))
+                if key not in seen:
                     out.append((path, score))
-                    seen.add(path)
+                    seen.add(key)
                     if len(out) >= length:
                         break
 
             if lo_i < len(lo):
                 path, score = lo[lo_i]
                 lo_i += 1
-                if path not in seen:
+                key = os.path.normcase(os.path.normpath(str(path)))
+                if key not in seen:
                     out.append((path, score))
-                    seen.add(path)
+                    seen.add(key)
 
     return out
+
 
 def _attach_llm_explanations(playlist: list[dict], policy: str, cfg: dict) -> dict[str, str]:
     """Attach per-transition explanations and return a global summary dict."""
@@ -404,7 +430,7 @@ def _attach_llm_explanations(playlist: list[dict], policy: str, cfg: dict) -> di
 
 def generate_from_bytes(audio_bytes: bytes, length: int = 20, policy: str = "smooth",
                         explain: bool = False, cfg_path: str = "config.yaml",
-                        audio_format: str = "m4a") -> dict:
+                        audio_format: str = "m4a", include_plus_paths: bool = False) -> dict:
     import tempfile
     import os
 
@@ -429,7 +455,8 @@ def generate_from_bytes(audio_bytes: bytes, length: int = 20, policy: str = "smo
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
 
-    pairs = _select_tracks(index, mapping, seed_emb, length, policy)
+    pairs = _select_tracks(index, mapping, seed_emb, length, policy,
+                           include_plus_paths=include_plus_paths)
     playlist = [{"path": p, "score": s, "title": Path(p).stem, "stats": {}} for p, s in pairs]
 
     summary: Dict[str, str] = {}
@@ -447,7 +474,8 @@ def generate_from_bytes(audio_bytes: bytes, length: int = 20, policy: str = "smo
     return result
 
 def generate_from_path(start_path: str, length: int = 20, policy: str = "smooth",
-                       explain: bool = False, cfg_path: str = "config.yaml") -> dict:
+                       explain: bool = False, cfg_path: str = "config.yaml",
+                       include_plus_paths: bool = False) -> dict:
     cfg = load_config(cfg_path)
     index, mapping = _load_index_and_mapping(cfg)
     model = _load_clap()
@@ -455,7 +483,8 @@ def generate_from_path(start_path: str, length: int = 20, policy: str = "smooth"
     seed_emb = _embed_with_model(model, y, sr).astype("float32")
     pairs = _select_tracks(
         index, mapping, seed_emb, length, policy,
-        seed_path=start_path, cfg=cfg
+        seed_path=start_path, cfg=cfg,
+        include_plus_paths=include_plus_paths
     )
     playlist = [{"path": p, "score": s, "title": Path(p).stem, "stats": {}} for p, s in pairs]
 
@@ -484,7 +513,7 @@ def main(argv=None):
     ap.add_argument(
         "--include-plus-paths",
         action="store_true",
-        help="Include recommendation candidates from folders ending in +",
+        help="Include recommendation candidates from directories whose names end in +",
     )
     args = ap.parse_args(argv)
 
@@ -664,7 +693,8 @@ def _seed_embedding_from_match(mapping, match):
     
     
 def generate_from_path(start_path: str, length: int = 20, policy: str = "smooth",
-                       explain: bool = False, cfg_path: str = "config.yaml") -> dict:
+                       explain: bool = False, cfg_path: str = "config.yaml",
+                       include_plus_paths: bool = False) -> dict:
     cfg = load_config(cfg_path)
     index, mapping = _load_index_and_mapping(cfg)
 
@@ -676,7 +706,11 @@ def generate_from_path(start_path: str, length: int = 20, policy: str = "smooth"
     if seed_emb is None:
         raise RuntimeError(f'No embedding found for "{match["song_name"]}".')
 
-    pairs = _select_tracks(index, mapping, seed_emb, length, policy)
+    pairs = _select_tracks(
+        index, mapping, seed_emb, length, policy,
+        seed_path=start_path, cfg=cfg,
+        include_plus_paths=include_plus_paths
+    )
     playlist = [{"path": p, "score": s, "title": Path(p).stem, "stats": {}} for p, s in pairs]
 
     summary: Dict[str, str] = {}
