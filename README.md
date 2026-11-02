@@ -183,7 +183,7 @@ llm:
 ### 1. Ingest your library
 
 ```sh
-python main.py ingest
+python main.py ingest  ## now replaced/duplicated/improved by rebuild_music_map.py
 ```
 
 This fingerprints your music, extracts features, makes embeddings, and builds the FAISS index.  
