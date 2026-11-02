@@ -1,4 +1,4 @@
-## ORIGINAL README for reference
+## ORIGINAL README for reference - please see ReadMe-fork.md for improvements etc
 # Local Music Recommendation System - Offline, Smooth, and Customizable
 
 This is an end-to-end **offline** music identification and recommendation system.  
@@ -183,7 +183,7 @@ llm:
 ### 1. Ingest your library
 
 ```sh
-python main.py ingest
+python main.py ingest  
 ```
 
 This fingerprints your music, extracts features, makes embeddings, and builds the FAISS index.  
