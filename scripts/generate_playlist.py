@@ -22,9 +22,11 @@ from scripts import explanation as ex
 from main import load_config
 from pathlib import Path
 import argparse
+import hashlib
+import random
 import json
 from pathlib import Path
-
+from datetime import datetime
 import yaml
 import numpy as np
 import faiss
@@ -205,15 +207,161 @@ def _load_feature_lookup(cfg):
     }
 
 
+def _load_sonic_neighbourhood(cfg, mapping):
+    """Load the graph produced by the raw-CLAP map builder and verify row alignment."""
+    graph_path = Path(cfg.get("sonic_neighbourhood_file", "data/sonic_neighbourhood.npz"))
+    if not graph_path.exists():
+        raise FileNotFoundError(
+            f"Sonic-neighbourhood graph not found: {graph_path}. "
+            "Run the raw-CLAP map-building script once to create it."
+        )
+
+    mapping_json = json.dumps(mapping, ensure_ascii=False, separators=(",", ":"))
+    expected_hash = hashlib.sha256(mapping_json.encode("utf-8")).hexdigest()
+    with np.load(graph_path, allow_pickle=False) as graph:
+        ids = np.asarray(graph["neighbour_ids"], dtype=np.int32)
+        scores = np.asarray(graph["neighbour_scores"], dtype=np.float32)
+        graph_hash = str(graph["mapping_hash"].item())
+        row_count = int(graph["row_count"].item())
+        dimensions = int(graph["dimensions"].item())
+
+    if row_count != len(mapping) or ids.shape[0] != len(mapping) or scores.shape != ids.shape:
+        raise ValueError(
+            f"Sonic graph/mapping size mismatch: graph rows={row_count}, "
+            f"IDs={ids.shape}, scores={scores.shape}, mapping={len(mapping)}"
+        )
+    if dimensions != 512:
+        raise ValueError(f"Expected a 512-D CLAP graph, found {dimensions}-D.")
+    if graph_hash != expected_hash:
+        raise ValueError(
+            "Sonic-neighbourhood graph mapping/order does not match the playlist mapping. "
+            "Re-run the raw-CLAP map builder to refresh it."
+        )
+    if np.any(ids >= len(mapping)):
+        raise ValueError("Sonic-neighbourhood graph contains out-of-range row IDs.")
+
+    print(
+        f"Loaded sonic-neighbourhood graph: {len(mapping):,} tracks, "
+        f"{ids.shape[1]} neighbours per track ({graph_path})",
+        flush=True,
+    )
+    return ids, scores
+
+
+def _select_sonic_neighbourhood(index, mapping, seed, length, seed_path=None,
+                                cfg=None, include_plus_paths=False,
+                                exploration=0.00, random_seed=None):
+    """Walk the saved CLAP-neighbour graph; exploration controls weaker-link sampling."""
+    import os
+    import re
+    import math
+
+    if cfg is None:
+        raise ValueError("The sonic_neighbourhood policy requires config.")
+    neighbour_ids, neighbour_scores = _load_sonic_neighbourhood(cfg, mapping)
+    rng = random.Random(random_seed)
+
+    def path_key(path):
+        return os.path.normcase(os.path.normpath(str(path)))
+
+    def in_plus_folder(path):
+        normalised = str(path).replace("\\", "/")
+        return re.search(r"(?:^|/)[^/]+\+/", normalised) is not None
+
+    seed_key = path_key(seed_path) if seed_path else None
+    current = None
+    if seed_key is not None:
+        for row, path in enumerate(mapping):
+            if path_key(path) == seed_key:
+                current = row
+                break
+
+    # External clips/paths start at their closest indexed library track.
+    if current is None:
+        distances, indices = index.search(seed, 1)
+        if len(indices[0]) == 0 or int(indices[0][0]) < 0:
+            raise RuntimeError("Could not locate the seed in the FAISS library.")
+        current = int(indices[0][0])
+        print(
+            f"Neighbourhood anchor: {Path(mapping[current]).parent.name} — "
+            f"{Path(mapping[current]).stem} (seed cosine={float(distances[0][0]):.3f})",
+            flush=True,
+        )
+
+    visited_rows = [current]
+    visited_paths = {path_key(mapping[current])}
+    if seed_key:
+        visited_paths.add(seed_key)
+    output = []
+    # 0 is nearly greedy; 1 spreads probability much more widely over the 16 links.
+    temperature = 0.015 + (0.12 * float(exploration))
+
+    while len(output) < length:
+        options = None
+
+        # Follow the current track. If its unused links are exhausted, backtrack
+        # through the route until a visited node has an eligible unused neighbour.
+        for source_row in reversed(visited_rows):
+            available = []
+            for candidate_id, score in zip(
+                neighbour_ids[source_row], neighbour_scores[source_row]
+            ):
+                candidate_id = int(candidate_id)
+                score = float(score)
+                if candidate_id < 0 or not np.isfinite(score):
+                    continue
+                candidate_path = mapping[candidate_id]
+                key = path_key(candidate_path)
+                if key in visited_paths:
+                    continue
+                if not include_plus_paths and in_plus_folder(candidate_path):
+                    continue
+                available.append((candidate_id, candidate_path, score))
+            if available:
+                options = available
+                break
+
+        if not options:
+            print(f"Sonic neighbourhood exhausted after {len(output)} recommendations.")
+            break
+
+        if exploration <= 0:
+            selected = max(options, key=lambda item: item[2])
+        else:
+            top_score = max(item[2] for item in options)
+            weights = [
+                math.exp((item[2] - top_score) / temperature)
+                for item in options
+            ]
+            selected = rng.choices(options, weights=weights, k=1)[0]
+
+        row, path, score = selected
+        visited_rows.append(row)
+        visited_paths.add(path_key(path))
+        output.append((path, score))
+
+    return output
+
+
 def _select_tracks(index, mapping, seed_emb: np.ndarray, length: int,
                    policy: str, seed_path=None, cfg=None,
-                   include_plus_paths=False):
+                   include_plus_paths=False, exploration=0.25,
+                   random_seed=None):
     import math
     import os
     import re
 
     seed = seed_emb.reshape(1, -1).astype("float32")
     faiss.normalize_L2(seed)
+
+    if policy == "sonic_neighbourhood":
+        if not 0.0 <= float(exploration) <= 1.0:
+            raise ValueError("--exploration must be between 0 and 1.")
+        return _select_sonic_neighbourhood(
+            index, mapping, seed, length, seed_path=seed_path, cfg=cfg,
+            include_plus_paths=include_plus_paths,
+            exploration=float(exploration), random_seed=random_seed,
+        )
 
     def in_plus_folder(path):
         # Exclude a directory whose name ends in "+", e.g. ".../Album+/".
@@ -361,7 +509,7 @@ def _select_tracks(index, mapping, seed_emb: np.ndarray, length: int,
 
     # Original CLAP-only ranking, including contrast policy.
     out = []
-    if policy == "smooth":
+    if policy in ("pure_sonic", "smooth"):
         seen = set()
         for path, score in sorted(cand, key=lambda item: item[1], reverse=True):
             key = os.path.normcase(os.path.normpath(str(path)))
@@ -430,7 +578,8 @@ def _attach_llm_explanations(playlist: list[dict], policy: str, cfg: dict) -> di
 
 def generate_from_bytes(audio_bytes: bytes, length: int = 20, policy: str = "smooth",
                         explain: bool = False, cfg_path: str = "config.yaml",
-                        audio_format: str = "m4a", include_plus_paths: bool = False) -> dict:
+                        audio_format: str = "m4a", include_plus_paths: bool = False,
+                        exploration: float = 0.25, random_seed: int | None = None) -> dict:
     import tempfile
     import os
 
@@ -455,8 +604,11 @@ def generate_from_bytes(audio_bytes: bytes, length: int = 20, policy: str = "smo
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
 
-    pairs = _select_tracks(index, mapping, seed_emb, length, policy,
-                           include_plus_paths=include_plus_paths)
+    pairs = _select_tracks(
+        index, mapping, seed_emb, length, policy, cfg=cfg,
+        include_plus_paths=include_plus_paths,
+        exploration=exploration, random_seed=random_seed,
+    )
     playlist = [{"path": p, "score": s, "title": Path(p).stem, "stats": {}} for p, s in pairs]
 
     summary: Dict[str, str] = {}
@@ -475,7 +627,8 @@ def generate_from_bytes(audio_bytes: bytes, length: int = 20, policy: str = "smo
 
 def generate_from_path(start_path: str, length: int = 20, policy: str = "smooth",
                        explain: bool = False, cfg_path: str = "config.yaml",
-                       include_plus_paths: bool = False) -> dict:
+                       include_plus_paths: bool = False, exploration: float = 0.25,
+                       random_seed: int | None = None) -> dict:
     cfg = load_config(cfg_path)
     index, mapping = _load_index_and_mapping(cfg)
     model = _load_clap()
@@ -484,7 +637,8 @@ def generate_from_path(start_path: str, length: int = 20, policy: str = "smooth"
     pairs = _select_tracks(
         index, mapping, seed_emb, length, policy,
         seed_path=start_path, cfg=cfg,
-        include_plus_paths=include_plus_paths
+        include_plus_paths=include_plus_paths,
+        exploration=exploration, random_seed=random_seed,
     )
     playlist = [{"path": p, "score": s, "title": Path(p).stem, "stats": {}} for p, s in pairs]
 
@@ -509,7 +663,19 @@ def main(argv=None):
     ap.add_argument("--input-audio", type=str, default="")
     ap.add_argument("--start-path", type=str, default="")
     ap.add_argument("--length", type=int, default=20)
-    ap.add_argument("--policy", type=str, choices=["smooth", "contrast"], default="smooth")
+    ap.add_argument(
+        "--policy", type=str,
+        choices=["pure_sonic", "smooth", "contrast", "sonic_neighbourhood"],
+        default="smooth",
+    )
+    ap.add_argument(
+        "--exploration", type=float, default=0.25,
+        help="Sonic-neighbourhood exploration from 0 (greedy) to 1 (adventurous).",
+    )
+    ap.add_argument(
+        "--random-seed", type=int, default=None,
+        help="Optional random seed for repeatable sonic-neighbourhood playlists.",
+    )
     ap.add_argument(
         "--include-plus-paths",
         action="store_true",
@@ -518,16 +684,19 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
-    index_path = Path(cfg.get("faiss_index_file", "data/faiss.index"))
-    map_path = Path(cfg.get("mapping_file", "data/embedding_mapping.json"))
+    if not 0.0 <= args.exploration <= 1.0:
+        ap.error("--exploration must be between 0 and 1.")
 
-    if not index_path.exists() or not map_path.exists():
-        print("Index/mapping missing. Run ingest first.")
+    try:
+        index, mapping = _load_index_and_mapping(cfg)
+    except Exception as e:
+        print(f"Could not load FAISS index/mapping: {e}")
         return
 
-    index = faiss.read_index(str(index_path))
-    with map_path.open("r", encoding="utf-8") as f:
-        mapping = list(json.load(f))
+    if index.ntotal != len(mapping):
+        raise ValueError(
+            f"FAISS/mapping row mismatch: index={index.ntotal}, mapping={len(mapping)}"
+        )
 
     # Seed embedding
     if args.input_audio:
@@ -563,7 +732,9 @@ def main(argv=None):
         args.policy,
         seed_path=args.start_path if args.start_path else None,
         cfg=cfg,
-        include_plus_paths=args.include_plus_paths
+        include_plus_paths=args.include_plus_paths,
+        exploration=args.exploration,
+        random_seed=args.random_seed,
     )
 
 # Build playlist with the seed first, followed by recommendations.
@@ -652,14 +823,38 @@ def main(argv=None):
     with out_path.open("w", encoding="utf-8") as f:
         json.dump(out_json, f, ensure_ascii=False, indent=2)
     print(f"\nSaved JSON: {out_path}")
-    # Also export a standard M3U playlist for foobar2000
-    m3u_path = out_path.with_suffix(".m3u8")
-    with m3u_path.open("w", encoding="utf-8-sig", newline="\n") as f:
+    # Export a uniquely named M3U playlist for foobar2000.
+    generated = datetime.now()
+    timestamp = generated.strftime("%Y%m%d_%H%M%S_%f")
+
+    if args.start_path:
+        seed_title = Path(args.start_path).stem
+    elif args.input_audio:
+        seed_title = match.get("song_name", "recognised_audio")
+    else:
+        seed_title = "unknown_seed"
+
+    import re
+    seed_slug = re.sub(r"[^A-Za-z0-9._-]+", "_", seed_title)
+    seed_slug = seed_slug.strip("._-")[:60] or "unknown_seed"
+
+    m3u_name = (
+        f"playlist_{timestamp}_{args.policy}_"
+        f"{args.length}_{seed_slug}.m3u8"
+    )
+    m3u_path = out_path.parent / m3u_name
+
+    with m3u_path.open("w", encoding="utf-8-sig", newline="\n") as f:   
         f.write("#EXTM3U\n")
+        f.write(f"# Generated: {generated.isoformat(timespec='seconds')}\n")
+        f.write(f"# Policy: {args.policy}\n")
+        f.write(f"# Requested length: {args.length}\n")
+        f.write(f"# Seed: {seed_title}\n")
         for track in playlist:
             track_path = track.get("path")
             if track_path:
                 f.write(str(track_path) + "\n")
+
     print(f"Saved M3U playlist: {m3u_path}")
     
 
@@ -694,7 +889,8 @@ def _seed_embedding_from_match(mapping, match):
     
 def generate_from_path(start_path: str, length: int = 20, policy: str = "smooth",
                        explain: bool = False, cfg_path: str = "config.yaml",
-                       include_plus_paths: bool = False) -> dict:
+                       include_plus_paths: bool = False, exploration: float = 0.25,
+                       random_seed: int | None = None) -> dict:
     cfg = load_config(cfg_path)
     index, mapping = _load_index_and_mapping(cfg)
 
@@ -709,7 +905,8 @@ def generate_from_path(start_path: str, length: int = 20, policy: str = "smooth"
     pairs = _select_tracks(
         index, mapping, seed_emb, length, policy,
         seed_path=start_path, cfg=cfg,
-        include_plus_paths=include_plus_paths
+        include_plus_paths=include_plus_paths,
+        exploration=exploration, random_seed=random_seed,
     )
     playlist = [{"path": p, "score": s, "title": Path(p).stem, "stats": {}} for p, s in pairs]
 

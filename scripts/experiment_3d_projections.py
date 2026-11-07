@@ -2,8 +2,6 @@
 from pathlib import Path
 import json
 import os
-import shutil
-from datetime import datetime
 
 import numpy as np
 from sklearn.decomposition import PCA
@@ -62,46 +60,10 @@ def save_checked(array, destination, expected_rows):
             temp.unlink()
 
 
-def backup_existing_outputs():
-    """Make timestamped copies of existing experiment outputs before replacing them."""
-    existing = [p for p in (PCA_OUTPUT, UMAP_OUTPUT, INFO_OUTPUT) if p.exists()]
-    if not existing:
-        print("No previous experimental outputs to back up.", flush=True)
-        return []
-
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backups = []
-
-    for source in existing:
-        backup = source.with_name(f"{source.stem}_{stamp}{source.suffix}")
-        counter = 1
-        while backup.exists():
-            backup = source.with_name(
-                f"{source.stem}_{stamp}_{counter}{source.suffix}"
-            )
-            counter += 1
-
-        shutil.copy2(source, backup)
-        backups.append(backup)
-        print(f"Backed up: {source.name} -> {backup.name}", flush=True)
-
-    return backups
-
-
-def save_json_checked(data, destination):
-    """Write JSON to a temporary file, then publish it atomically."""
-    temp = destination.with_name(destination.stem + "_building" + destination.suffix)
-    try:
-        temp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        json.loads(temp.read_text(encoding="utf-8"))
-        os.replace(temp, destination)
-    finally:
-        if temp.exists():
-            temp.unlink()
-
-
 def main():
-    backup_existing_outputs()
+    #for path in (PCA_OUTPUT, UMAP_OUTPUT, INFO_OUTPUT):
+    #    if path.exists():
+    #        raise FileExistsError(f"Experimental output already exists: {path}")
 
     print("Loading embeddings and mapping...", flush=True)
 
@@ -145,10 +107,9 @@ def main():
     # Experiment B: direct UMAP
     print("\nExperiment B: direct UMAP 512D -> 3D...", flush=True)
 
-    umap_neighbors = min(30, max(2, n - 1))
     reducer = umap.UMAP(
         n_components=3,
-        n_neighbors=umap_neighbors,
+        n_neighbors=30,
         min_dist=0.1,
         metric="cosine",
         random_state=RANDOM_STATE,
@@ -169,14 +130,17 @@ def main():
         "pca_explained_variance": pca.explained_variance_ratio_.tolist(),
         "umap_method": "Direct UMAP from normalised 512D embeddings",
         "umap_metric": "cosine",
-        "umap_neighbors": umap_neighbors,
+        "umap_neighbors": 30,
         "umap_min_dist": 0.1,
         "random_state": RANDOM_STATE,
         "pca_output": PCA_OUTPUT.name,
         "umap_output": UMAP_OUTPUT.name,
     }
 
-    save_json_checked(info, INFO_OUTPUT)
+    INFO_OUTPUT.write_text(
+        json.dumps(info, indent=2),
+        encoding="utf-8",
+    )
 
     print("\nEXPERIMENTS COMPLETED", flush=True)
     print(f"PCA coordinates:  {PCA_OUTPUT}", flush=True)

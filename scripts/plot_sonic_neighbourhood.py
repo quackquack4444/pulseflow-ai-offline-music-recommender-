@@ -3,6 +3,7 @@ import json, os, plistlib, re, colorsys, socket, subprocess, sys
 from urllib.parse import urlparse, unquote
 import numpy as np
 import faiss
+import hashlib
 import plotly.graph_objects as go
 from scipy.spatial import cKDTree
 
@@ -20,6 +21,7 @@ TEMP_OUTPUT = DATA / "music_map_raw_clap_12_pca_direct_genre_ollama_verbose.buil
 LIVE_RE = re.compile(r"\blive\b|livealbum|concert|unplugged|bootleg|\bin concert\b|\blive at\b|\blive in\b", re.I)
 MUSIC_PREFIX = "M:\\Music\\Music\\"
 SONIC_NEIGHBOURS = 16   # CLAP neighbours stored per track; 8 are shown, extras replace any '+' folders you exclude
+SONIC_GRAPH_FILE = DATA / "sonic_neighbourhood.npz"
 PLUS_DIR_RE = re.compile(r"\+[\\/]")   # a folder name ending in '+', e.g. ...\Album+\Track.m4a
 
 # --- Optional CLAP mood/sound tags (made once by make_clap_tags.py) ----------
@@ -216,6 +218,31 @@ def load_clap_tags(n):
     print(f"CLAP tags loaded: {len(names)} tags; {sum(1 for t in track_tags if t):,} tracks have at least one.", flush=True)
     return names, groups, track_tags
 
+def save_sonic_neighbourhood(neighbour_ids, neighbour_scores, paths):
+    """Persist the raw-512D CLAP graph for playlist generation."""
+    ids = np.full((len(paths), SONIC_NEIGHBOURS), -1, dtype=np.int32)
+    scores = np.full((len(paths), SONIC_NEIGHBOURS), np.nan, dtype=np.float32)
+    for row, (row_ids, row_scores) in enumerate(zip(neighbour_ids, neighbour_scores)):
+        count = min(SONIC_NEIGHBOURS, len(row_ids), len(row_scores))
+        if count:
+            ids[row, :count] = np.asarray(row_ids[:count], dtype=np.int32)
+            scores[row, :count] = np.asarray(row_scores[:count], dtype=np.float32)
+
+    mapping_json = json.dumps(paths, ensure_ascii=False, separators=(",", ":"))
+    mapping_hash = hashlib.sha256(mapping_json.encode("utf-8")).hexdigest()
+    temp_file = SONIC_GRAPH_FILE.with_name(SONIC_GRAPH_FILE.stem + ".building.npz")
+    np.savez_compressed(
+        temp_file, neighbour_ids=ids, neighbour_scores=scores,
+        mapping_hash=np.asarray(mapping_hash),
+        row_count=np.asarray(len(paths), dtype=np.int64),
+        dimensions=np.asarray(512, dtype=np.int32),
+        neighbour_count=np.asarray(SONIC_NEIGHBOURS, dtype=np.int32),
+        method=np.asarray("normalised 512-D CLAP cosine via HNSW inner product"),
+    )
+    os.replace(temp_file, SONIC_GRAPH_FILE)
+    print(f"Saved reusable sonic-neighbourhood graph: {SONIC_GRAPH_FILE}", flush=True)
+
+
 def build_clap_context(embeddings, labels, genre_names):
     """Precompute full-512D CLAP neighbours, cluster-centre scores and genre summaries."""
     print("Building full-512D CLAP neighbour index (one-time step)...", flush=True)
@@ -232,7 +259,7 @@ def build_clap_context(embeddings, labels, genre_names):
         pairs = [(int(i), float(sc)) for i, sc in zip(row_ids, row_scores) if i >= 0 and int(i) != row]
         pairs = pairs[:SONIC_NEIGHBOURS]
         neighbour_ids.append([i for i, _ in pairs])
-        neighbour_scores.append([round(score, 3) for _, score in pairs])
+        neighbour_scores.append([float(score) for _, score in pairs])
     print("Calculating similarities to the 12 CLAP cluster centres...", flush=True)
     centroids = []
     for cluster_id in range(12):
@@ -500,6 +527,7 @@ def main():
     bpm, key_names, track_key, energy_bucket = load_audio_features(paths)
     genre_names = [metadata.get(norm_path(path), {}).get("genre", "Unknown / untagged") or "Unknown / untagged" for path in paths]
     neighbour_ids, neighbour_scores, centroid_scores, cluster_genres = build_clap_context(embeddings, labels, genre_names)
+    save_sonic_neighbourhood(neighbour_ids, neighbour_scores, paths)
     genre_options = sorted((name for name in set(genre_names) if not name.endswith("+")), key=lambda value: (value.casefold() != "classical", value.casefold()))
     print(f"Genres available for filtering: {len(genre_options):,}", flush=True)
     initial = [i for i in range(n) if type_ids[i] == 0 and labels[i] == 0]
